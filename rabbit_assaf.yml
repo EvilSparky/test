@@ -1,0 +1,92 @@
+---
+- hosts: rabbit
+  remote_user: root
+
+  roles:
+  - common
+  - ansible-role-repo-epel
+      
+  tasks:
+    - name: install packages
+      yum: name={{ item }} state=latest
+      with_items:
+        - rabbitmq-server
+
+    - name: enable rabbitmq-server
+      service: name=rabbitmq-server enabled=yes state=started
+
+    - name: enable rabbitmq_management
+      command: rabbitmq-plugins enable rabbitmq_management
+      notify: restart rabbit
+
+    - name: fetch the erlang cookie from the first rabbit
+      fetch: src=/var/lib/rabbitmq/.erlang.cookie dest=../tmp/.erlang.cookie flat=yes
+      when: first_rabbit is defined
+
+    - name: check for erlang cookie locally (is multi rabbit)
+      local_action: stat path=../tmp/.erlang.cookie
+      register: stat_ecookie
+
+    - name: put erlang cookie
+      template: src=../tmp/.erlang.cookie dest=/var/lib/rabbitmq/.erlang.cookie owner=rabbitmq group=rabbitmq mode=0400
+      when: first_rabbit is undefined and rabbit_cluster_master is defined and stat_ecookie.stat.exists
+      notify: restart rabbit
+
+    - name: stop rabbitmq app before joining cluster
+      shell: rabbitmqctl stop_app
+      when: first_rabbit is undefined and rabbit_cluster_master is defined
+
+    - name: reset rabbitmq app before joining cluster
+      shell: rabbitmqctl reset
+      when: first_rabbit is undefined and rabbit_cluster_master is defined
+
+    - name: add this node to cluster
+      shell: rabbitmqctl join_cluster rabbit@{{ rabbit_cluster_master }}
+      register: join_cluster_output
+      ignore_errors: True
+      when: first_rabbit is undefined and rabbit_cluster_master is defined
+
+    - name: skip fail if the node is already a member of the cluster
+      fail: msg="join_cluster failed but node is not already a member"
+      when: first_rabbit is undefined  and rabbit_cluster_master is defined and ("'already_member' not in join_cluster_output.stderr") and (join_cluster_output.rc == 1)
+
+    - name: start rabbitmq app after join
+      shell: rabbitmqctl start_app
+      when: first_rabbit is undefined and rabbit_cluster_master is defined
+
+    - name: remove previous incorrect cluster configuration
+      shell: rabbitmqctl clear_policy "all"
+      when: first_rabbit is defined and rabbit_cluster_master is defined
+      
+    - name: enable queue mirroring
+      shell: rabbitmqctl set_policy ha-all "" '{"ha-mode":"all","ha-sync-mode":"automatic"}'
+      when: first_rabbit is defined and rabbit_cluster_master is defined
+      
+    - name: copy rabbitmq zabbix monitoring scripts
+      copy: src=../files/rabbitmq/etc/zabbix/scripts dest=/etc/zabbix/ owner=zabbix group=zabbix mode=755
+      
+    - name: copy rabbitmq zabbix monitoring config
+      copy: src=../files/rabbitmq/etc/zabbix/zabbix_agentd.d/zabbix-rabbitmq.conf dest=/etc/zabbix/zabbix_agentd.d/ owner=root group=root mode=644
+    
+    - name: change permission to .rab.auth
+      shell: chmod 644 /etc/zabbix/scripts/rabbitmq/.rab.auth
+      
+    - name: change file permissinos for python selinux
+      shell: chown root:root /etc/zabbix/scripts/rabbitmq/my-python.*
+      
+    - name: change mode for python selinux
+      shell: chmod 644 /etc/zabbix/scripts/rabbitmq/my-python.*
+      
+    - name: apply python selinux module
+      shell: semodule -i my-python.pp chdir=/etc/zabbix/scripts/rabbitmq
+      
+    - name: update zabbix agent conf
+      template: src=../templates/rabbitmq/etc/zabbix/zabbix_agentd.conf dest=/etc/zabbix/zabbix_agentd.conf owner=root group=root mode=644
+      notify: 
+        - restart zabbix-agent
+
+  handlers:
+    - name: restart rabbit
+      service: name=rabbitmq-server state=restarted
+    - name: restart zabbix-agent
+      service: name=zabbix-agent  state=restarted
